@@ -23,7 +23,7 @@ by match ID, and leaves missing bookmaker links null. Neither command reads or
 writes `links.csv`, `schedules.csv`, or instance CSV files. The minute scraper
 returns an in-memory summary and persists its results in PostgreSQL.
 
-On the first due run, the scraper creates `scraper_runs`, `bookmaker_outcomes`,
+On the first minute check, the scraper creates `scraper_runs`, `bookmaker_outcomes`,
 and `outcome_odds`. It commits a distinct run UUID, intended slot ID, and actual
 UTC `started_at` before opening bookmaker sessions. Each bookmaker attempt
 has its own UUID, actual `attempted_at`, source timestamp where available,
@@ -55,7 +55,7 @@ same slot, including unchanged successful readings, receive distinct run and
 attempt IDs; there is no uniqueness constraint on the scheduled slot in
 `scraper_runs`.
 
-The first due run upgrades an existing ticket #4 database transactionally by
+The first minute check upgrades an existing ticket #4 database transactionally by
 adding `attempt_number` and a unique index on `(run_id, bookmaker, attempt_number)`.
 Existing outcomes keep their IDs, times, and odds and receive attempt number 1.
 
@@ -77,7 +77,36 @@ For controlled-time checks, `persist_listings(..., now=...)` and
 `select_due_work(connection, run_time=...)` and
 `generate_instance(run_time=...)` accept the minute-check time. Naive timestamps
 are interpreted as UTC; aware timestamps are converted to UTC. Selection does
-not backfill earlier minutes. Missed-slot reconciliation belongs to #6.
+not backfill earlier minutes.
+
+Every minute check first reconciles missed slots, including when no current work
+is due. `missed_slots` stores one record per elapsed, uncancelled slot without a
+launched run, with its slot ID and actual UTC `detected_at`. Joining to
+`scheduled_slots` preserves the original match ID, intended scheduled time, and
+kickoff. Only minutes before the current UTC minute are considered elapsed;
+a check at 17:46:30 can still scrape the 17:46 minute. Cancelled slots are
+excluded. Slots with any recorded run, including a failed or incomplete run,
+are attempted collections rather than missed collections.
+
+After downtime or a desktop logout, the next invocation records the gaps and
+scrapes only the currently due minute. It creates no run, bookmaker attempt, or
+odds for a missed slot. Current runs retain their actual start and attempt
+timestamps. Repeated checks preserve the first detection time and do not
+duplicate missed records. Rediscovery does not erase elapsed gaps when kickoff
+changes; future slots cancelled by rescheduling do not become missed records.
+Reconciliation, due selection, and run registration share one transaction and
+lock, so overlapping minute checks cannot mark selected work missed before its
+run is registered. The transaction commits before bookmaker IO begins.
+
+Query missed collection alongside its intended time with:
+
+```sql
+SELECT s.match_id, s.id AS slot_id, s.scheduled_time, s.kickoff,
+       'missed' AS status, m.detected_at
+FROM missed_slots m
+JOIN scheduled_slots s ON s.id = m.slot_id
+ORDER BY s.match_id, s.scheduled_time;
+```
 
 `matches.id` is the stable internal UUID. A bookmaker event ID preserves that
 identity across source name, URL slug, and kickoff changes. When a source URL has
@@ -112,6 +141,9 @@ exhausted retries, and session startup retries locally. With
 controlled bookmaker sessions, no CSV access, actual run/attempt timestamps,
 partial/failed/missing-link results, unchanged readings, complete retry history,
 the upgrade from ticket #4, and committed run visibility before bookmaker IO.
+It also covers missed-slot reconciliation after downtime with no due work,
+repeated checks, collection within the current minute, failed and incomplete
+runs, and cancellation and historical gaps after a kickoff change.
 `generate_instance(session_factories=...)`
 accepts factories keyed by `cal`, `pn`, and `pd` for these controlled responses;
 the default CLI retains the existing headed browser sessions.

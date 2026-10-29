@@ -7,7 +7,9 @@ import pandas as pd
 import requests
 
 from utilities.scheduled_work import select_due_work, utc_timestamp
-from utilities.run_storage import normalize_reading, start_runs, store_outcomes
+from utilities.run_storage import (
+    normalize_reading, reconcile_missed_slots, start_runs, store_outcomes,
+)
 
 
 MAX_ATTEMPTS = 3
@@ -314,16 +316,22 @@ def generate_instance(
 
     run_time = utc_timestamp(run_time)
     with psycopg.connect(database_url, autocommit=True) as connection:
-        scheduled_links = select_due_work(connection, run_time=run_time)
+        # Keep the reconciliation lock through registration so another minute
+        # check cannot mark selected work missed before its run is visible.
+        with connection.transaction():
+            missed_count = reconcile_missed_slots(connection, run_time=run_time)
+            scheduled_links = select_due_work(connection, run_time=run_time)
+            if not scheduled_links.empty:
+                if session_factories is None:
+                    session_factories = _default_session_factories()
+                if set(session_factories) != {prefix for prefix, _ in BOOKMAKERS}:
+                    raise ValueError("Provide session factories for cal, pn, and pd")
+                runs = start_runs(connection, scheduled_links)
+        if missed_count:
+            print(f"Recorded {missed_count} missed scheduled slot(s)")
         if scheduled_links.empty:
             print(f"No matches scheduled for {run_time.floor('min').isoformat()}")
             return pd.DataFrame()
-
-        if session_factories is None:
-            session_factories = _default_session_factories()
-        if set(session_factories) != {prefix for prefix, _ in BOOKMAKERS}:
-            raise ValueError("Provide session factories for cal, pn, and pd")
-        runs = start_runs(connection, scheduled_links)
         print(f"Scraping {len(runs)} scheduled match(es)")
         batch_results = collect_bookmaker_outcomes(runs, session_factories)
         store_outcomes(connection, runs, batch_results)

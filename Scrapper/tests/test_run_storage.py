@@ -406,4 +406,126 @@ class PersistedRunTests(unittest.TestCase):
     def test_no_due_work_creates_no_run(self):
         self.seed()
         self.assertTrue(self.collect(run_time="2026-11-01T17:44:00Z").empty)
-        self.assertIsNone(self.connection.execute("SELECT to_regclass('scraper_runs')").fetchone()[0])
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM scraper_runs").fetchone()[0])
+
+    def test_resume_records_missed_slots_without_fabricating_runs(self):
+        self.seed()
+        before = utc_timestamp()
+        self.assertTrue(self.collect(run_time="2026-11-01T18:01:00Z").empty)
+        after = utc_timestamp()
+        rows = self.connection.execute(
+            "SELECT s.match_id, s.scheduled_time, m.detected_at "
+            "FROM missed_slots m JOIN scheduled_slots s ON s.id = m.slot_id "
+            "ORDER BY s.scheduled_time"
+        ).fetchall()
+        expected = [pd.Timestamp("2026-11-01T17:40:00Z"),
+                    *pd.date_range("2026-11-01T17:45:00Z", "2026-11-01T17:59:00Z", freq="min")]
+        self.assertEqual(expected, [row[1] for row in rows])
+        self.assertEqual(1, len({row[0] for row in rows}))
+        for _, _, detected_at in rows:
+            self.assertLessEqual(before, detected_at)
+            self.assertLessEqual(detected_at, after)
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM scraper_runs").fetchone()[0])
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM bookmaker_outcomes").fetchone()[0])
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM outcome_odds").fetchone()[0])
+        # Another check must neither duplicate gaps nor replace detection times.
+        self.assertTrue(self.collect(run_time="2026-11-01T18:02:00Z").empty)
+        self.assertEqual(rows, self.connection.execute(
+            "SELECT s.match_id, s.scheduled_time, m.detected_at "
+            "FROM missed_slots m JOIN scheduled_slots s ON s.id = m.slot_id "
+            "ORDER BY s.scheduled_time"
+        ).fetchall())
+
+    def test_resume_scrapes_only_current_minute_and_preserves_actual_start_time(self):
+        self.seed()
+        before = utc_timestamp()
+        result = self.collect(run_time="2026-11-01T17:46:30Z")
+        after = utc_timestamp()
+        self.assertEqual(1, len(result))
+        run = result.iloc[0]
+        self.assertEqual(pd.Timestamp("2026-11-01T17:46:00Z"), run["scheduled_time"])
+        self.assertLessEqual(before, run["started_at"])
+        self.assertLessEqual(run["started_at"], after)
+        self.assertEqual([
+            (pd.Timestamp("2026-11-01T17:40:00Z"),),
+            (pd.Timestamp("2026-11-01T17:45:00Z"),),
+        ], self.connection.execute(
+            "SELECT s.scheduled_time FROM missed_slots m "
+            "JOIN scheduled_slots s ON s.id = m.slot_id ORDER BY s.scheduled_time"
+        ).fetchall())
+        self.assertEqual(1, self.connection.execute("SELECT count(*) FROM scraper_runs").fetchone()[0])
+        self.assertEqual(3, self.connection.execute("SELECT count(*) FROM bookmaker_outcomes").fetchone()[0])
+
+    def test_failed_and_incomplete_runs_are_not_missed_slots(self):
+        from utilities.run_storage import start_runs
+        from utilities.scheduled_work import select_due_work
+
+        self.seed()
+        failed = self.collect(
+            values={prefix: ValueError("invalid response") for prefix in ("cal", "pn", "pd")},
+            run_time="2026-11-01T17:45:00Z",
+        )
+        incomplete = start_runs(self.connection, select_due_work(
+            self.connection, run_time="2026-11-01T17:46:00Z",
+        ))
+        self.assertTrue(self.collect(run_time="2026-11-01T18:01:00Z").empty)
+        for slot_id in (failed.iloc[0]["slot_id"], incomplete.iloc[0]["slot_id"]):
+            self.assertEqual(0, self.connection.execute(
+                "SELECT count(*) FROM missed_slots WHERE slot_id = %s", (slot_id,),
+            ).fetchone()[0])
+        self.assertIsNone(self.connection.execute(
+            "SELECT completed_at FROM scraper_runs WHERE id = %s",
+            (incomplete.iloc[0]["run_id"],),
+        ).fetchone()[0])
+        self.assertEqual(14, self.connection.execute("SELECT count(*) FROM missed_slots").fetchone()[0])
+
+    def test_run_registration_failure_rolls_back_missed_slot_reconciliation(self):
+        import psycopg
+
+        self.seed()
+        self.assertTrue(self.collect(run_time="2026-11-01T17:39:00Z").empty)
+        # Reject new runs at the database boundary to exercise atomic recovery.
+        self.connection.execute("""
+            CREATE FUNCTION reject_run_registration() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'run registration unavailable';
+            END;
+            $$
+        """)
+        self.connection.execute("""
+            CREATE TRIGGER reject_run_registration
+            BEFORE INSERT ON scraper_runs FOR EACH ROW
+            EXECUTE FUNCTION reject_run_registration()
+        """)
+        with self.assertRaisesRegex(psycopg.errors.RaiseException, "run registration unavailable"):
+            self.collect(run_time="2026-11-01T17:45:00Z")
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM missed_slots").fetchone()[0])
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM scraper_runs").fetchone()[0])
+
+    def test_rescheduling_preserves_elapsed_gaps_and_excludes_cancelled_slots(self):
+        from match_discovery import persist_listings
+        from test_discovery_storage import listing
+
+        self.seed()
+        old_slots = self.connection.execute(
+            "SELECT id FROM scheduled_slots "
+            "WHERE scheduled_time <= '2026-11-01T17:46:00Z'"
+        ).fetchall()
+        persist_listings(self.connection, [
+            listing(bookmaker, "Atlas-vs-Leon", "2026-11-01T19:00:00Z", index + 100)
+            for index, bookmaker in enumerate(("caliente", "pinnacle", "playdoit"))
+        ], now="2026-11-01T17:46:00Z")
+        self.assertTrue(self.collect(run_time="2026-11-01T18:01:00Z").empty)
+        for (slot_id,) in old_slots:
+            self.assertEqual(1, self.connection.execute(
+                "SELECT count(*) FROM missed_slots WHERE slot_id = %s", (slot_id,),
+            ).fetchone()[0])
+        self.assertEqual(0, self.connection.execute(
+            "SELECT count(*) FROM missed_slots m JOIN scheduled_slots s ON s.id = m.slot_id "
+            "WHERE s.cancelled_at IS NOT NULL"
+        ).fetchone()[0])
+        self.assertEqual(0, self.connection.execute(
+            "SELECT count(*) FROM missed_slots m JOIN scheduled_slots s ON s.id = m.slot_id "
+            "WHERE s.scheduled_time >= '2026-11-01T18:01:00Z'"
+        ).fetchone()[0])

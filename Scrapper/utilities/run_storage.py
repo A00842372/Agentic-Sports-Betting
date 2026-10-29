@@ -110,6 +110,33 @@ def start_runs(connection, scheduled_links):
     return runs
 
 
+def reconcile_missed_slots(connection, run_time=None):
+    """Record elapsed, uncancelled slots with no launched run.
+
+    The current UTC minute is still eligible for collection. Missed slots retain
+    their intended time through scheduled_slots and never create observations.
+    """
+    minute = utc_timestamp(run_time).floor("min")
+    with connection.transaction():
+        _create_run_tables(connection)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS missed_slots (
+                slot_id UUID PRIMARY KEY REFERENCES scheduled_slots(id),
+                detected_at TIMESTAMPTZ NOT NULL
+            )
+        """)
+        result = connection.execute("""
+            INSERT INTO missed_slots (slot_id, detected_at)
+            SELECT s.id, %s
+            FROM scheduled_slots s
+            WHERE s.scheduled_time < %s
+              AND s.cancelled_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM scraper_runs r WHERE r.slot_id = s.id)
+            ON CONFLICT (slot_id) DO NOTHING
+        """, (utc_timestamp().to_pydatetime(), minute.to_pydatetime()))
+    return result.rowcount
+
+
 def _store_attempt(connection, run, bookmaker, result):
     url = run[LINK_COLUMNS[bookmaker]]
     source_timestamp = result.get("source_timestamp")
