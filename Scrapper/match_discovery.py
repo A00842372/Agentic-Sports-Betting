@@ -1,6 +1,9 @@
 import re
 import unicodedata
+import os
 from difflib import SequenceMatcher
+from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import pandas as pd
 
@@ -50,10 +53,10 @@ def match_similarity(left_match, right_match):
     """Return a 0-100 similarity score while preserving home/away order."""
     left_home, left_away = _split_match(left_match)
     right_home, right_away = _split_match(right_match)
-    return (
-        _team_similarity(left_home, right_home)
-        + _team_similarity(left_away, right_away)
-    ) / 2
+    return min(
+        _team_similarity(left_home, right_home),
+        _team_similarity(left_away, right_away),
+    )
 
 
 def add_bookmaker_links(
@@ -61,7 +64,7 @@ def add_bookmaker_links(
     bookmaker,
     link_column,
     tolerance=pd.Timedelta(minutes=5),
-    minimum_similarity=45,
+    minimum_similarity=85,
     ambiguity_margin=10,
 ):
     """Attach one-to-one bookmaker links using kickoff time and name similarity."""
@@ -93,22 +96,17 @@ def add_bookmaker_links(
         if candidates.empty:
             continue
 
-        if len(candidates) == 1:
-            best_index = candidates.index[0]
-        else:
-            scores = candidates["match"].map(
-                lambda candidate: match_similarity(
-                    base_match["match"], candidate
-                )
-            ).sort_values(ascending=False)
-            best_score = scores.iloc[0]
-            second_best_score = scores.iloc[1]
-            if (
-                best_score < minimum_similarity
-                or best_score - second_best_score < ambiguity_margin
-            ):
-                continue
-            best_index = scores.index[0]
+        scores = candidates["match"].map(
+            lambda candidate: match_similarity(base_match["match"], candidate)
+        ).sort_values(ascending=False)
+        best_score = scores.iloc[0]
+        second_best_score = scores.iloc[1] if len(scores) > 1 else None
+        if best_score < minimum_similarity or (
+            second_best_score is not None
+            and best_score - second_best_score < ambiguity_margin
+        ):
+            continue
+        best_index = scores.index[0]
 
         result.at[result_index, link_column] = available.at[
             best_index, link_column
@@ -116,6 +114,164 @@ def add_bookmaker_links(
         available = available.drop(index=best_index)
 
     return result
+
+
+def _source_key(bookmaker, url):
+    """Keep a bookmaker event's identity when its URL slug changes."""
+    parsed = urlsplit(url)
+    if bookmaker == "caliente":
+        event = re.search(r"/e/(\d+)(?:/|$)", parsed.path)
+    elif bookmaker == "pinnacle":
+        event = re.search(r"/(\d+)/?$", parsed.path)
+    elif bookmaker == "playdoit":
+        parameters = parse_qs(parsed.fragment, keep_blank_values=True)
+        ids = parameters.get("eventId", [])
+        event = re.fullmatch(r"(\d+)", ids[0]) if ids else None
+    else:
+        raise ValueError(f"Unknown bookmaker: {bookmaker}")
+    return event.group(1) if event else url
+
+
+def _create_discovery_tables(connection):
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
+            id UUID PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            kickoff TIMESTAMPTZ,
+            review_reason TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS bookmaker_listings (
+            bookmaker TEXT NOT NULL CHECK (bookmaker IN ('caliente', 'pinnacle', 'playdoit')),
+            source_key TEXT NOT NULL,
+            match_id UUID NOT NULL REFERENCES matches(id),
+            source_name TEXT NOT NULL,
+            source_kickoff TIMESTAMPTZ,
+            source_url TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (bookmaker, source_key)
+        )
+    """)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS bookmaker_listings_match_id_idx "
+        "ON bookmaker_listings(match_id)"
+    )
+
+
+def persist_listings(connection, listings, tolerance=pd.Timedelta(minutes=5),
+                     minimum_similarity=85, ambiguity_margin=10):
+    """Reconcile source listings and save current evidence in one transaction.
+
+    A source event ID takes precedence over names and kickoff during rediscovery.
+    New cross-bookmaker links require name similarity even with one time candidate.
+    """
+    with connection.transaction():
+        # Discovery writes are serialized across simultaneous processes.
+        connection.execute("SELECT pg_advisory_xact_lock(756249102)")
+        _create_discovery_tables(connection)
+        match_rows = connection.execute(
+            "SELECT id, display_name, kickoff, review_reason FROM matches"
+        ).fetchall()
+        matches = {
+            row[0]: {"name": row[1], "kickoff": pd.Timestamp(row[2]),
+                     "review_reason": row[3], "bookmakers": set()}
+            for row in match_rows
+        }
+        source_rows = connection.execute(
+            "SELECT bookmaker, source_key, match_id FROM bookmaker_listings"
+        ).fetchall()
+        known_sources = {}
+        for bookmaker, source_key, match_id in source_rows:
+            known_sources[(bookmaker, source_key)] = match_id
+            matches[match_id]["bookmakers"].add(bookmaker)
+
+        for listing in listings:
+            bookmaker = listing["bookmaker"]
+            name = str(listing["match"]).strip()
+            url = str(listing["url"]).strip()
+            kickoff = pd.Timestamp(listing["start_time"])
+            if not name or not url:
+                raise ValueError("Listing needs a name and URL")
+            if pd.isna(kickoff):
+                kickoff_value = None
+            elif kickoff.tzinfo is None:
+                kickoff = kickoff.tz_localize("UTC")
+                kickoff_value = kickoff.to_pydatetime()
+            else:
+                kickoff = kickoff.tz_convert("UTC")
+                kickoff_value = kickoff.to_pydatetime()
+            key = _source_key(bookmaker, url)
+            source = (bookmaker, key)
+            match_id = known_sources.get(source)
+            if match_id is None:
+                candidates = []
+                same_bookmaker_candidate = False
+                for candidate_id, candidate in matches.items():
+                    if pd.isna(kickoff) or pd.isna(candidate["kickoff"]):
+                        continue
+                    if abs(candidate["kickoff"] - kickoff) > tolerance:
+                        continue
+                    score = match_similarity(name, candidate["name"])
+                    if bookmaker in candidate["bookmakers"]:
+                        if score >= minimum_similarity:
+                            same_bookmaker_candidate = True
+                        continue
+                    candidates.append((score, candidate_id))
+                candidates.sort(reverse=True)
+                if pd.isna(kickoff):
+                    review_reason = "missing_kickoff"
+                elif same_bookmaker_candidate:
+                    review_reason = "source_identity_changed"
+                elif not candidates:
+                    review_reason = None
+                elif candidates[0][0] < minimum_similarity:
+                    review_reason = "low_name_similarity"
+                elif (len(candidates) > 1 and
+                      candidates[0][0] - candidates[1][0] < ambiguity_margin):
+                    review_reason = "ambiguous_candidates"
+                else:
+                    review_reason = None
+                    match_id = candidates[0][1]
+                if match_id is None:
+                    match_id = uuid4()
+                    connection.execute(
+                        "INSERT INTO matches (id, display_name, kickoff, review_reason) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (match_id, name, kickoff_value, review_reason),
+                    )
+                    matches[match_id] = {
+                        "name": name, "kickoff": kickoff,
+                        "review_reason": review_reason, "bookmakers": set(),
+                    }
+                known_sources[source] = match_id
+
+            connection.execute("""
+                INSERT INTO bookmaker_listings
+                    (bookmaker, source_key, match_id, source_name,
+                     source_kickoff, source_url)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (bookmaker, source_key) DO UPDATE SET
+                    source_name = EXCLUDED.source_name,
+                    source_kickoff = EXCLUDED.source_kickoff,
+                    source_url = EXCLUDED.source_url,
+                    updated_at = now()
+            """, (bookmaker, key, match_id, name, kickoff_value, url))
+            matches[match_id]["bookmakers"].add(bookmaker)
+            # Prefer the Caliente listing as the current display anchor.
+            if kickoff_value is not None and (
+                bookmaker == "caliente" or len(matches[match_id]["bookmakers"]) == 1
+            ):
+                connection.execute(
+                    "UPDATE matches SET display_name = %s, kickoff = %s, "
+                    "updated_at = now() WHERE id = %s",
+                    (name, kickoff_value, match_id),
+                )
+                matches[match_id]["name"] = name
+                matches[match_id]["kickoff"] = kickoff
+
+    return len(listings)
 
 
 pinnacle_urls = [
@@ -146,22 +302,48 @@ playdoit_urls = [
     "https://www.playdoit.mx/#page=championship&championshipIds=10009",
 ]
 
-links = []
+def run_discovery(database_url=None):
+    """Collect current listings, persist them, and retain transition CSVs."""
+    database_url = database_url or os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("Set DATABASE_URL for PostgreSQL discovery storage")
 
-for index in range(7):
-    caliente = caliente_links(caliente_urls[index])
-    pinnacle = pinnacle_links(pinnacle_urls[index])
-    playdoit = playdoit_links(playdoit_urls[index])
+    import psycopg
 
-    matches = add_bookmaker_links(caliente, pinnacle, "Pinnacle link")
-    matches = add_bookmaker_links(matches, playdoit, "Playdoit link")
+    links = []
+    source_listings = []
+    for index in range(len(caliente_urls)):
+        caliente = caliente_links(caliente_urls[index])
+        pinnacle = pinnacle_links(pinnacle_urls[index])
+        playdoit = playdoit_links(playdoit_urls[index])
+        for bookmaker, frame, column in (
+            ("caliente", caliente, "Caliente link"),
+            ("pinnacle", pinnacle, "Pinnacle link"),
+            ("playdoit", playdoit, "Playdoit link"),
+        ):
+            for _, row in frame.iterrows():
+                if pd.notna(row[column]):
+                    source_listings.append({
+                        "bookmaker": bookmaker,
+                        "match": row["match"],
+                        "start_time": row["start_time"],
+                        "url": row[column],
+                    })
 
-    links.append(matches)
+        matches = add_bookmaker_links(caliente, pinnacle, "Pinnacle link")
+        matches = add_bookmaker_links(matches, playdoit, "Playdoit link")
+        links.append(matches)
+
+    with psycopg.connect(database_url) as connection:
+        persist_listings(connection, source_listings)
+
+    # The current minute-check still reads these files until ticket #3.
+    links_dataframe = pd.concat(links, ignore_index=True)
+    schedules_dataframe = schedule(links_dataframe)
+    links_dataframe.to_csv("links.csv", index=False)
+    schedules_dataframe.to_csv("schedules.csv", index=False)
+    return len(source_listings)
 
 
-# Export the combined match links and scraping schedules as CSV files.
-links_dataframe = pd.concat(links, ignore_index=True)
-schedules_dataframe = schedule(links_dataframe)
-
-links_dataframe.to_csv("links.csv", index=False)
-schedules_dataframe.to_csv("schedules.csv", index=False)
+if __name__ == "__main__":
+    run_discovery()
