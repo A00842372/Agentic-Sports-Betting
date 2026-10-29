@@ -80,6 +80,16 @@ def _create_run_tables(connection):
             PRIMARY KEY (outcome_id, field)
         )
     """)
+    # Existing final outcomes from ticket #4 are each attempt 1 of their run.
+    connection.execute("""
+        ALTER TABLE bookmaker_outcomes
+        ADD COLUMN IF NOT EXISTS attempt_number INTEGER NOT NULL DEFAULT 1
+            CHECK (attempt_number > 0)
+    """)
+    connection.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS bookmaker_outcomes_attempt_idx
+        ON bookmaker_outcomes(run_id, bookmaker, attempt_number)
+    """)
     connection.execute("CREATE INDEX IF NOT EXISTS scraper_runs_slot_idx ON scraper_runs(slot_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS bookmaker_outcomes_run_idx ON bookmaker_outcomes(run_id)")
 
@@ -100,8 +110,32 @@ def start_runs(connection, scheduled_links):
     return runs
 
 
+def _store_attempt(connection, run, bookmaker, result):
+    url = run[LINK_COLUMNS[bookmaker]]
+    source_timestamp = result.get("source_timestamp")
+    connection.execute("""
+        INSERT INTO bookmaker_outcomes
+            (id, run_id, bookmaker, attempt_number, attempted_at, source_timestamp,
+             source_name, source_url, status, error, missing_fields)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        result["id"], run["run_id"], bookmaker, result["attempt_number"],
+        result["attempted_at"].to_pydatetime(),
+        None if source_timestamp is None else source_timestamp.to_pydatetime(),
+        result.get("source_name"), None if pd.isna(url) else str(url),
+        result["status"], result["error"] or None,
+        result.get("missing_fields", list(ODDS_FIELDS)),
+    ))
+    odds = result.get("odds", dict.fromkeys(ODDS_FIELDS))
+    with connection.cursor() as cursor:
+        cursor.executemany(
+            "INSERT INTO outcome_odds (outcome_id, field, value) VALUES (%s, %s, %s)",
+            [(result["id"], field, odds[field]) for field in ODDS_FIELDS],
+        )
+
+
 def store_outcomes(connection, runs, batch_results):
-    """Commit final bookmaker outcomes and completion timestamps together.
+    """Commit every bookmaker attempt and completion timestamps together.
 
     Every existing odds field has a numeric row, including explicit SQL NULLs
     for failures and missing links. No comparison to previous odds is performed.
@@ -110,28 +144,8 @@ def store_outcomes(connection, runs, batch_results):
         for row_index, run in runs.iterrows():
             for prefix, bookmaker in BOOKMAKER_NAMES.items():
                 result = batch_results[prefix][row_index]
-                outcome_id = uuid4()
-                url = run[LINK_COLUMNS[bookmaker]]
-                source_timestamp = result.get("source_timestamp")
-                connection.execute("""
-                    INSERT INTO bookmaker_outcomes
-                        (id, run_id, bookmaker, attempted_at, source_timestamp,
-                         source_name, source_url, status, error, missing_fields)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    outcome_id, run["run_id"], bookmaker,
-                    result["attempted_at"].to_pydatetime(),
-                    None if source_timestamp is None else source_timestamp.to_pydatetime(),
-                    result.get("source_name"), None if pd.isna(url) else str(url),
-                    result["status"], result["error"] or None,
-                    result.get("missing_fields", list(ODDS_FIELDS)),
-                ))
-                odds = result.get("odds", dict.fromkeys(ODDS_FIELDS))
-                with connection.cursor() as cursor:
-                    cursor.executemany(
-                        "INSERT INTO outcome_odds (outcome_id, field, value) VALUES (%s, %s, %s)",
-                        [(outcome_id, field, odds[field]) for field in ODDS_FIELDS],
-                    )
+                for attempt in result["attempts"]:
+                    _store_attempt(connection, run, bookmaker, attempt)
         completed_at = utc_timestamp().to_pydatetime()
         with connection.cursor() as cursor:
             cursor.executemany(

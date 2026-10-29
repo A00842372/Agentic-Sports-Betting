@@ -25,10 +25,11 @@ returns an in-memory summary and persists its results in PostgreSQL.
 
 On the first due run, the scraper creates `scraper_runs`, `bookmaker_outcomes`,
 and `outcome_odds`. It commits a distinct run UUID, intended slot ID, and actual
-UTC `started_at` before opening bookmaker sessions. Each bookmaker's final
-outcome has its own UUID, actual `attempted_at`, source timestamp where available,
+UTC `started_at` before opening bookmaker sessions. Each bookmaker attempt
+has its own UUID, actual `attempted_at`, source timestamp where available,
 source name and URL, status (`ok`, `partial`, `failed`, or `missing_link`), and
-error details. Bookmaker initialization failures are recorded as failed outcomes;
+error details and a one-based `attempt_number` within its run and bookmaker.
+Bookmaker initialization failures are recorded as failed attempts;
 absent links are recorded without opening a session for those listings.
 
 `outcome_odds` stores the existing 30 odds fields as named rows with PostgreSQL
@@ -38,25 +39,37 @@ these gaps. Usable prices in a partial reading are retained. Invalid source
 timestamps produce a null source timestamp and an error detail while preserving
 the odds; the actual outcome time is recorded independently.
 
-All outcomes from one collection launch and its `completed_at` timestamps commit
+All attempts from one collection launch and its `completed_at` timestamps commit
 together. A database write failure propagates as an error, leaving the previously
 committed runs incomplete (`completed_at IS NULL`). A process interruption can
-also leave an incomplete run. Durable outage replay belongs to #7. This ticket
-stores the final result after the existing retry behavior; preserving every
-intermediate retry belongs to #5. Repeated launches and unchanged successful
-readings already receive distinct run and outcome IDs.
+also leave an incomplete run. Durable outage replay belongs to #7.
+
+Every failed retry is retained before a successful or final failed reading,
+including transient session startup failures. Startup failures apply only to
+listings with links; missing links produce one `missing_link` outcome. Startup
+and scrape attempts share one increasing attempt order per run and bookmaker.
+The existing retry limit and backoff remain unchanged. The returned in-memory
+summary still shows the final outcome for each bookmaker. IDs are assigned
+during collection and reused when storing attempts. Repeated launches for the
+same slot, including unchanged successful readings, receive distinct run and
+attempt IDs; there is no uniqueness constraint on the scheduled slot in
+`scraper_runs`.
+
+The first due run upgrades an existing ticket #4 database transactionally by
+adding `attempt_number` and a unique index on `(run_id, bookmaker, attempt_number)`.
+Existing outcomes keep their IDs, times, and odds and receive attempt number 1.
 
 For example, query home-win prices and gaps with:
 
 ```sql
 SELECT s.match_id, s.scheduled_time, r.id AS run_id, r.started_at,
-       o.bookmaker, o.attempted_at, o.source_timestamp,
+       o.bookmaker, o.attempt_number, o.attempted_at, o.source_timestamp,
        o.status, o.error, d.value AS home_win_price
 FROM scheduled_slots s
 JOIN scraper_runs r ON r.slot_id = s.id
 JOIN bookmaker_outcomes o ON o.run_id = r.id
 JOIN outcome_odds d ON d.outcome_id = o.id AND d.field = 'HT'
-ORDER BY s.match_id, r.started_at, o.bookmaker;
+ORDER BY s.match_id, r.started_at, r.id, o.bookmaker, o.attempt_number;
 ```
 
 For controlled-time checks, `persist_listings(..., now=...)` and
@@ -93,10 +106,12 @@ successful run with skips does not verify PostgreSQL behavior.
 renaming and rescheduling, preserved elapsed slots, unchanged slot identity,
 kickoff changes within a minute, and the existing cadence boundaries.
 
-`test_run_storage.py` verifies typed and partial readings locally. With
+`test_run_storage.py` verifies typed and partial readings, retries that recover,
+exhausted retries, and session startup retries locally. With
 `TEST_DATABASE_URL`, it also exercises discovery-to-scrape persistence with
 controlled bookmaker sessions, no CSV access, actual run/attempt timestamps,
-partial/failed/missing-link results, unchanged readings, and committed run
-visibility before bookmaker IO. `generate_instance(session_factories=...)`
+partial/failed/missing-link results, unchanged readings, complete retry history,
+the upgrade from ticket #4, and committed run visibility before bookmaker IO.
+`generate_instance(session_factories=...)`
 accepts factories keyed by `cal`, `pn`, and `pd` for these controlled responses;
 the default CLI retains the existing headed browser sessions.

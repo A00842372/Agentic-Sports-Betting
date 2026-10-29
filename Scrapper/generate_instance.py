@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from time import sleep
+from uuid import uuid4
 
 import pandas as pd
 import requests
@@ -68,15 +69,15 @@ def _result_from_value(prefix, value):
 
 
 def _missing_link_result():
-    return {
+    return _with_attempt_history({
         "value": None,
         "status": "missing_link",
         "error": "No event link available",
         "attempted_at": utc_timestamp(),
-    }
+    }, [])
 
 
-def _scrape_with_retries(session, prefix, link_column, link_row):
+def _scrape_with_retries(session, prefix, link_column, link_row, attempts):
     link = link_row[link_column]
     if pd.isna(link) or not str(link).strip():
         return _missing_link_result()
@@ -85,8 +86,8 @@ def _scrape_with_retries(session, prefix, link_column, link_row):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         attempted_at = utc_timestamp()
         try:
-            return {**_result_from_value(prefix, session.scrape(link)),
-                    "attempted_at": attempted_at}
+            result = {**_result_from_value(prefix, session.scrape(link)),
+                      "attempted_at": attempted_at}
         except Exception as error:
             should_retry = (
                 attempt < MAX_ATTEMPTS and _is_transient_error(error)
@@ -95,25 +96,42 @@ def _scrape_with_retries(session, prefix, link_column, link_row):
                 f"Attempt {attempt}/{MAX_ATTEMPTS} failed for "
                 f"{link_row['match']} from {link_column}: {error}"
             )
+            result = {
+                "value": None,
+                "status": "failed",
+                "error": f"{type(error).__name__}: {_error_text(error)}",
+                "attempted_at": attempted_at,
+            }
+            _record_attempt(attempts, result)
             if not should_retry:
-                return {
-                    "value": None,
-                    "status": "failed",
-                    "error": f"{type(error).__name__}: {_error_text(error)}",
-                    "attempted_at": attempted_at,
-                }
+                return {**result, "attempts": attempts}
             sleep(2 ** (attempt - 1))
+        else:
+            _record_attempt(attempts, result)
+            return {**result, "attempts": attempts}
 
     raise RuntimeError("unreachable retry state")
 
 
-def _open_session(session_factory, link_column):
+def _record_attempt(attempts, result):
+    result.update(id=uuid4(), attempt_number=len(attempts) + 1)
+    attempts.append(result)
+
+
+def _with_attempt_history(result, attempts):
+    _record_attempt(attempts, result)
+    return {**result, "attempts": attempts}
+
+
+def _open_session(session_factory, link_column, record_failure):
     """Open a bookmaker session, retrying only transient startup failures."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        session = session_factory()
+        attempted_at = utc_timestamp()
         try:
+            session = session_factory()
             return session.__enter__()
         except Exception as error:
+            record_failure(error, attempted_at)
             should_retry = (
                 attempt < MAX_ATTEMPTS and _is_transient_error(error)
             )
@@ -131,16 +149,27 @@ def _open_session(session_factory, link_column):
 def _scrape_bookmaker_batch(links, prefix, link_column, session_factory):
     """Scrape one bookmaker sequentially through one reusable session."""
     results = {}
+    histories = {row_index: [] for row_index in links.index}
     session = None
-    session_started_at = utc_timestamp()
+
+    def record_session_failure(error, attempted_at):
+        for row_index in links.index:
+            if row_index not in results:
+                _record_attempt(histories[row_index], {
+                    "value": None,
+                    "status": "failed",
+                    "error": f"Session failure: {type(error).__name__}: {_error_text(error)}",
+                    "attempted_at": attempted_at,
+                })
+
     try:
         for row_index, link_row in links.iterrows():
             link = link_row[link_column]
             if pd.isna(link) or not str(link).strip():
-                results[row_index] = _scrape_with_retries(None, prefix, link_column, link_row)
+                results[row_index] = _missing_link_result()
         if len(results) == len(links):
             return prefix, results
-        session = _open_session(session_factory, link_column)
+        session = _open_session(session_factory, link_column, record_session_failure)
         for row_index, link_row in links.iterrows():
             if row_index in results:
                 continue
@@ -149,6 +178,7 @@ def _scrape_bookmaker_batch(links, prefix, link_column, session_factory):
                 prefix,
                 link_column,
                 link_row,
+                histories[row_index],
             )
     except Exception as error:
         session_error = f"{type(error).__name__}: {_error_text(error)}"
@@ -160,12 +190,15 @@ def _scrape_bookmaker_batch(links, prefix, link_column, session_factory):
             if pd.isna(link) or not str(link).strip():
                 results[row_index] = _missing_link_result()
             else:
-                results[row_index] = {
-                    "value": None,
-                    "status": "failed",
-                    "error": f"Session failure: {session_error}",
-                    "attempted_at": session_started_at,
-                }
+                attempts = histories[row_index]
+                if not attempts:
+                    _record_attempt(attempts, {
+                        "value": None,
+                        "status": "failed",
+                        "error": f"Session failure: {session_error}",
+                        "attempted_at": utc_timestamp(),
+                    })
+                results[row_index] = {**attempts[-1], "attempts": attempts}
     finally:
         if session is not None:
             try:
@@ -186,12 +219,12 @@ def _failed_batch(links, link_column, error):
         if pd.isna(link) or not str(link).strip():
             results[row_index] = _missing_link_result()
         else:
-            results[row_index] = {
+            results[row_index] = _with_attempt_history({
                 "value": None,
                 "status": "failed",
                 "error": error_text,
                 "attempted_at": utc_timestamp(),
-            }
+            }, [])
     return results
 
 

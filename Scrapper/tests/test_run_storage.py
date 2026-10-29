@@ -98,7 +98,91 @@ class ControlledSession:
         return self.value.copy()
 
 
+class ScriptedSession(ControlledSession):
+    def __init__(self, responses):
+        super().__init__(None)
+        self.responses = iter(responses)
+
+    def scrape(self, link):
+        self.value = next(self.responses)
+        return super().scrape(link)
+
+
 class CollectedOutcomeTests(unittest.TestCase):
+    def test_session_retries_and_scrape_retries_share_ordered_history(self):
+        from generate_instance import collect_bookmaker_outcomes
+
+        links = pd.DataFrame([
+            {"match": "Atlas-vs-Leon", "Caliente link": "https://example.test/cal",
+             "Pinnacle link": None, "Playdoit link": None},
+            {"match": "No-Caliente-Link", "Caliente link": None,
+             "Pinnacle link": None, "Playdoit link": None},
+        ])
+        openings = []
+
+        def recovering_factory():
+            openings.append(True)
+            if len(openings) == 1:
+                raise TimeoutError("startup timed out")
+            return ScriptedSession([TimeoutError("scrape timed out"), reading("cal")])
+
+        results = collect_bookmaker_outcomes(links, {
+            "cal": recovering_factory,
+            "pn": lambda: ControlledSession(None),
+            "pd": lambda: ControlledSession(None),
+        })
+        attempts = results["cal"][0]["attempts"]
+        self.assertEqual(["failed", "failed", "ok"], [a["status"] for a in attempts])
+        self.assertEqual([1, 2, 3], [a["attempt_number"] for a in attempts])
+        self.assertIn("startup timed out", attempts[0]["error"])
+        self.assertIn("scrape timed out", attempts[1]["error"])
+        self.assertEqual(1, len(results["cal"][1]["attempts"]))
+        self.assertEqual("missing_link", results["cal"][1]["status"])
+
+    def test_exhausted_retries_preserve_each_failure(self):
+        from generate_instance import collect_bookmaker_outcomes
+
+        links = pd.DataFrame([{
+            "match": "Atlas-vs-Leon", "Caliente link": "https://example.test/cal",
+            "Pinnacle link": "https://example.test/pn", "Playdoit link": None,
+        }])
+        results = collect_bookmaker_outcomes(links, {
+            "cal": lambda: ControlledSession(TimeoutError("still unavailable")),
+            "pn": lambda: ControlledSession(ValueError("bad response")),
+            "pd": lambda: ControlledSession(None),
+        })
+        attempts = results["cal"][0]["attempts"]
+        self.assertEqual(["failed"] * 3, [a["status"] for a in attempts])
+        self.assertEqual([1, 2, 3], [a["attempt_number"] for a in attempts])
+        self.assertEqual(3, len({a["id"] for a in attempts}))
+        self.assertEqual(1, len(results["pn"][0]["attempts"]))
+        missing = results["pd"][0]["attempts"]
+        self.assertEqual(["missing_link"], [a["status"] for a in missing])
+        self.assertEqual(1, missing[0]["attempt_number"])
+
+    def test_retry_preserves_failed_attempt_before_success(self):
+        from generate_instance import collect_bookmaker_outcomes
+
+        links = pd.DataFrame([{
+            "match": "Atlas-vs-Leon", "Caliente link": "https://example.test/cal",
+            "Pinnacle link": None, "Playdoit link": None,
+        }])
+
+        results = collect_bookmaker_outcomes(links, {
+            "cal": lambda: ScriptedSession([TimeoutError("bookmaker timed out"), reading("cal")]),
+            "pn": lambda: ControlledSession(None),
+            "pd": lambda: ControlledSession(None),
+        })
+        result = results["cal"][0]
+        self.assertEqual("ok", result["status"])
+        attempts = result["attempts"]
+        self.assertEqual(["failed", "ok"], [a["status"] for a in attempts])
+        self.assertEqual([1, 2], [a["attempt_number"] for a in attempts])
+        self.assertNotEqual(attempts[0]["id"], attempts[1]["id"])
+        self.assertIn("bookmaker timed out", attempts[0]["error"])
+        self.assertLessEqual(attempts[0]["attempted_at"], attempts[1]["attempted_at"])
+        self.assertEqual(Decimal("2.15"), attempts[1]["odds"]["HT"])
+
     def test_session_startup_failure_does_not_discard_other_bookmakers(self):
         from generate_instance import collect_bookmaker_outcomes
 
@@ -252,6 +336,50 @@ class PersistedRunTests(unittest.TestCase):
         self.assertNotEqual(first.iloc[0]["run_id"], second.iloc[0]["run_id"])
         self.assertEqual(first.iloc[0]["slot_id"], second.iloc[0]["slot_id"])
         self.assertEqual(2, self.connection.execute("SELECT count(*) FROM scraper_runs").fetchone()[0])
+        self.assertEqual(6, self.connection.execute("SELECT count(*) FROM bookmaker_outcomes").fetchone()[0])
+
+    def test_retry_history_keeps_ids_order_errors_and_final_odds(self):
+        from generate_instance import generate_instance
+
+        self.seed()
+
+        result = generate_instance(
+            database_url=self.database_url, run_time="2026-11-01T17:59:00Z",
+            session_factories={
+                "cal": lambda: ScriptedSession([TimeoutError("temporary timeout"), reading("cal")]),
+                "pn": lambda: ControlledSession(reading("pn")),
+                "pd": lambda: ControlledSession(reading("pd")),
+            },
+        )
+        rows = self.connection.execute(
+            "SELECT o.id, o.attempt_number, o.status, o.error, o.attempted_at, d.value "
+            "FROM bookmaker_outcomes o JOIN outcome_odds d ON d.outcome_id = o.id "
+            "WHERE o.run_id = %s AND o.bookmaker = 'caliente' AND d.field = 'HT' "
+            "ORDER BY o.attempt_number", (result.iloc[0]["run_id"],),
+        ).fetchall()
+        self.assertEqual([1, 2], [r[1] for r in rows])
+        self.assertEqual(["failed", "ok"], [r[2] for r in rows])
+        self.assertNotEqual(rows[0][0], rows[1][0])
+        self.assertIn("temporary timeout", rows[0][3])
+        self.assertLessEqual(rows[0][4], rows[1][4])
+        self.assertEqual([None, Decimal("2.15")], [r[5] for r in rows])
+        self.assertEqual("ok", result.iloc[0]["cal_status"])
+
+    def test_existing_outcomes_survive_retry_schema_upgrade(self):
+        self.seed()
+        self.collect()
+        original = self.connection.execute(
+            "SELECT id, attempted_at, status FROM bookmaker_outcomes ORDER BY id"
+        ).fetchall()
+        # Recreate the schema from ticket #4, retaining its real stored data.
+        self.connection.execute("ALTER TABLE bookmaker_outcomes DROP COLUMN attempt_number CASCADE")
+        self.collect()
+        for outcome_id, attempted_at, status in original:
+            row = self.connection.execute(
+                "SELECT attempted_at, status, attempt_number FROM bookmaker_outcomes WHERE id = %s",
+                (outcome_id,),
+            ).fetchone()
+            self.assertEqual((attempted_at, status, 1), row)
         self.assertEqual(6, self.connection.execute("SELECT count(*) FROM bookmaker_outcomes").fetchone()[0])
 
     def test_run_is_visible_to_another_connection_before_bookmaker_io(self):
