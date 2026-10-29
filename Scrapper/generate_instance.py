@@ -1,9 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import os
 from time import sleep
 
 import pandas as pd
 import requests
+
+from utilities.scheduled_work import select_due_work, utc_timestamp
 
 from utilities.caliente_scrapper import CalienteSession
 from utilities.pinnacle_scrapper import PinnacleSession
@@ -249,7 +252,12 @@ def _build_dataframe(links, batch_results):
         rows.append(
             pd.concat(
                 [
-                    pd.Series({"match": match_name}),
+                    pd.Series({
+                        "match": match_name,
+                        "match_id": link_row["match_id"],
+                        "slot_id": link_row["slot_id"],
+                        "scheduled_time": link_row["scheduled_time"],
+                    }),
                     match_result,
                     pd.Series(scrape_details),
                 ]
@@ -258,99 +266,22 @@ def _build_dataframe(links, batch_results):
     return pd.DataFrame(rows)
 
 
-def _utc_timestamp(value):
-    timestamp = pd.Timestamp(value)
-    if timestamp.tzinfo is None:
-        return timestamp.tz_localize("UTC")
-    return timestamp.tz_convert("UTC")
-
-
-def _select_scheduled_links(links, schedules, run_time=None):
-    required_link_columns = {"match", "start_time"}
-    required_schedule_columns = {
-        "match",
-        "start_time",
-        "scheduled_time",
-    }
-    if not required_link_columns.issubset(links.columns):
-        raise ValueError("links must contain 'match' and 'start_time' columns")
-    if not required_schedule_columns.issubset(schedules.columns):
-        raise ValueError(
-            "schedules must contain 'match', 'start_time', and "
-            "'scheduled_time' columns"
-        )
-
-    if run_time is None:
-        run_time = pd.Timestamp.now(tz="UTC")
-    else:
-        run_time = _utc_timestamp(run_time)
-    run_minute = run_time.floor("min")
-
-    scheduled_times = pd.to_datetime(
-        schedules["scheduled_time"],
-        errors="coerce",
-        utc=True,
-    )
-    invalid_scheduled_times = (
-        schedules["scheduled_time"].notna() & scheduled_times.isna()
-    )
-    if invalid_scheduled_times.any():
-        raise ValueError("scheduled_time contains invalid datetime values")
-
-    due = schedules.loc[
-        scheduled_times.dt.floor("min") == run_minute,
-        ["match", "start_time"],
-    ].copy()
-    if due.empty:
-        return links.iloc[0:0].copy()
-
-    due["start_time"] = pd.to_datetime(
-        due["start_time"],
-        errors="coerce",
-        utc=True,
-    )
-    if due["start_time"].isna().any():
-        raise ValueError("schedule start_time contains invalid datetime values")
-    due_keys = set(due.itertuples(index=False, name=None))
-
-    link_start_times = pd.to_datetime(
-        links["start_time"],
-        errors="coerce",
-        utc=True,
-    )
-    invalid_link_start_times = links["start_time"].notna() & link_start_times.isna()
-    if invalid_link_start_times.any():
-        raise ValueError("links start_time contains invalid datetime values")
-
-    selected = links.loc[
-        [
-            (match_name, start_time) in due_keys
-            for match_name, start_time in zip(
-                links["match"],
-                link_start_times,
-            )
-        ]
-    ].copy()
-    return selected
-
-
 def generate_instance(
-    links_path="links.csv",
-    schedule_path="schedules.csv",
     output_path=None,
     run_time=None,
+    database_url=None,
 ):
-    links = pd.read_csv(links_path)
-    schedules = pd.read_csv(schedule_path)
-    scheduled_links = _select_scheduled_links(
-        links,
-        schedules,
-        run_time=run_time,
-    )
+    database_url = database_url or os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("Set DATABASE_URL for PostgreSQL due-work selection")
+
+    import psycopg
+
+    run_time = utc_timestamp(run_time)
+    with psycopg.connect(database_url) as connection:
+        scheduled_links = select_due_work(connection, run_time=run_time)
     if scheduled_links.empty:
-        run_minute = _utc_timestamp(
-            run_time if run_time is not None else pd.Timestamp.now(tz="UTC")
-        ).floor("min")
+        run_minute = run_time.floor("min")
         print(f"No matches scheduled for {run_minute.isoformat()}")
         return pd.DataFrame()
 

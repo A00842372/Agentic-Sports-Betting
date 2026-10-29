@@ -10,7 +10,7 @@ import pandas as pd
 from utilities.caliente_links import caliente_links
 from utilities.pinnacle_links import pinnacle_links
 from utilities.playdoit_links import playdoit_links
-from utilities.schedule import schedule
+from utilities.scheduled_work import refresh_scheduled_slots
 
 
 def _normalize_team(team):
@@ -161,7 +161,7 @@ def _create_discovery_tables(connection):
 
 
 def persist_listings(connection, listings, tolerance=pd.Timedelta(minutes=5),
-                     minimum_similarity=85, ambiguity_margin=10):
+                     minimum_similarity=85, ambiguity_margin=10, now=None):
     """Reconcile source listings and save current evidence in one transaction.
 
     A source event ID takes precedence over names and kickoff during rediscovery.
@@ -271,6 +271,8 @@ def persist_listings(connection, listings, tolerance=pd.Timedelta(minutes=5),
                 matches[match_id]["name"] = name
                 matches[match_id]["kickoff"] = kickoff
 
+        refresh_scheduled_slots(connection, now=now)
+
     return len(listings)
 
 
@@ -302,15 +304,14 @@ playdoit_urls = [
     "https://www.playdoit.mx/#page=championship&championshipIds=10009",
 ]
 
-def run_discovery(database_url=None):
-    """Collect current listings, persist them, and retain transition CSVs."""
+def run_discovery(database_url=None, now=None):
+    """Collect listings and atomically persist current evidence and future slots."""
     database_url = database_url or os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("Set DATABASE_URL for PostgreSQL discovery storage")
 
     import psycopg
 
-    links = []
     source_listings = []
     for index in range(len(caliente_urls)):
         caliente = caliente_links(caliente_urls[index])
@@ -330,18 +331,9 @@ def run_discovery(database_url=None):
                         "url": row[column],
                     })
 
-        matches = add_bookmaker_links(caliente, pinnacle, "Pinnacle link")
-        matches = add_bookmaker_links(matches, playdoit, "Playdoit link")
-        links.append(matches)
-
     with psycopg.connect(database_url) as connection:
-        persist_listings(connection, source_listings)
+        persist_listings(connection, source_listings, now=now)
 
-    # The current minute-check still reads these files until ticket #3.
-    links_dataframe = pd.concat(links, ignore_index=True)
-    schedules_dataframe = schedule(links_dataframe)
-    links_dataframe.to_csv("links.csv", index=False)
-    schedules_dataframe.to_csv("schedules.csv", index=False)
     return len(source_listings)
 
 
