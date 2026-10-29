@@ -3,6 +3,16 @@
 Published spec: [#14 — Final Lubuntu validation for all PostgreSQL migration tickets](https://github.com/A00842372/Agentic-Sports-Betting/issues/14)
 (`ready-for-agent`). Implementation coverage is #1–#13; #14 is the final gate.
 
+## Current execution evidence
+
+See [the 2026-10-29 local execution report](validation/2026-10-29-local.md)
+for the implementation at `d0213dd` plus the ticket #14 working-tree additions.
+It records local coverage added since the audit, every remaining A/B/C
+case, and environmental blockers. The original snapshot below is historical:
+backup and history-input test files and the #12/#13 launcher/guide now exist.
+The final deployment gate remains incomplete; local command stand-ins are not
+database, graphical-session, timer, or VPN evidence.
+
 ## Purpose and timing
 
 Finish the implementation tickets first. Then use this inventory and its

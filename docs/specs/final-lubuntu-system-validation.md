@@ -108,6 +108,21 @@ campaign starts; this campaign can supply the evidence their gates require.
 
 ## Further Notes
 
+### Local implementation evidence and remaining tests
+
+The [2026-10-29 local execution report](../validation/2026-10-29-local.md)
+reconciles **every A01–A24, B01–B19 and C01–C13 case** below against the current
+implementation. It records new executable local history-input, backup-command
+and launcher-command coverage, with explicit remaining subchecks and their
+prerequisites. All PostgreSQL, real recovery, Lubuntu desktop/systemd and
+modeling-device/VPN checks remain required. Missing automated cases remain
+NOT WRITTEN, separately from environment-blocked executions and actual skips.
+Issue/acceptance refresh and type checking are also blocked by unavailable
+network/dependencies in this workspace. This report does not complete the gate.
+
+The following audit details and counts describe the original snapshot, not the
+current local test count or the current availability of launcher/guide files.
+
 The companion inventory records 24 exact existing skips, 19 missing/additional
 coverage groups and 13 target/cross-device check groups. Some missing tests can
 be written and run locally; the inventory explicitly distinguishes them from
