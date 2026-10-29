@@ -1,0 +1,17 @@
+[Unit]
+Description=Collect currently due bookmaker odds in the desktop session
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/agentic-sports-betting/scraper.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecCondition="%h/.local/bin/agentic-scraper-minute" --check-session
+ExecStart="%h/.local/bin/agentic-scraper-minute"
+UMask=0077
+KillMode=control-group
+TimeoutStartSec=infinity
+StandardOutput=journal
+StandardError=journal

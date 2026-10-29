@@ -1,0 +1,9 @@
+[Unit]
+Description=Check due bookmaker odds each minute during graphical login
+PartOf=graphical-session.target
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=false
+Unit=agentic-scraper-minute.service
