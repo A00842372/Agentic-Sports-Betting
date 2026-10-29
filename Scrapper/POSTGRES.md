@@ -2,6 +2,8 @@
 
 For the modeling machine's read-only credentials, match history API, and query
 filters, see [HISTORY.md](HISTORY.md).
+For scheduled backups, isolated restore verification, and recovery, see
+[the collection backup runbook](../docs/collection-backups.md).
 
 Install the PostgreSQL driver in the scraper's Python environment:
 
