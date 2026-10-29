@@ -8,8 +8,10 @@ import requests
 
 from utilities.scheduled_work import select_due_work, utc_timestamp
 from utilities.run_storage import (
-    normalize_reading, reconcile_missed_slots, start_runs, store_outcomes,
+    normalize_reading, prepare_collection, prepare_runs, reconcile_missed_slots,
+    start_runs, store_collection,
 )
+from utilities.outcome_queue import OutcomeQueue
 
 
 MAX_ATTEMPTS = 3
@@ -302,40 +304,71 @@ def _build_dataframe(links, batch_results):
     return pd.DataFrame(rows)
 
 
+def _replay_outcomes(queue, database_url):
+    import psycopg
+
+    def write_collection(collection):
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            store_collection(connection, collection)
+
+    try:
+        count = queue.replay(write_collection)
+    except psycopg.Error as error:
+        print(f"Results remain queued at {queue.path}: {type(error).__name__}: {_error_text(error)}")
+        return False
+    if count:
+        print(f"Persisted {count} queued collection(s)")
+    return True
+
+
 def generate_instance(
     run_time=None,
     database_url=None,
     session_factories=None,
+    queue_path=None,
 ):
-    """Persist due runs and final bookmaker outcomes; return an in-memory summary."""
+    """Collect due work and durably deliver completed results to PostgreSQL."""
     database_url = database_url or os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("Set DATABASE_URL for PostgreSQL due-work selection")
 
     import psycopg
 
+    queue = OutcomeQueue(queue_path)
+    _replay_outcomes(queue, database_url)
     run_time = utc_timestamp(run_time)
-    with psycopg.connect(database_url, autocommit=True) as connection:
-        # Keep the reconciliation lock through registration so another minute
-        # check cannot mark selected work missed before its run is visible.
-        with connection.transaction():
-            missed_count = reconcile_missed_slots(connection, run_time=run_time)
-            scheduled_links = select_due_work(connection, run_time=run_time)
-            if not scheduled_links.empty:
-                if session_factories is None:
-                    session_factories = _default_session_factories()
-                if set(session_factories) != {prefix for prefix, _ in BOOKMAKERS}:
-                    raise ValueError("Provide session factories for cal, pn, and pd")
-                runs = start_runs(connection, scheduled_links)
-        if missed_count:
-            print(f"Recorded {missed_count} missed scheduled slot(s)")
-        if scheduled_links.empty:
-            print(f"No matches scheduled for {run_time.floor('min').isoformat()}")
-            return pd.DataFrame()
-        print(f"Scraping {len(runs)} scheduled match(es)")
-        batch_results = collect_bookmaker_outcomes(runs, session_factories)
-        store_outcomes(connection, runs, batch_results)
-    return _build_dataframe(runs, batch_results)
+    runs = None
+    try:
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            # Serialize normal minute checks through registration, retaining
+            # local identities if PostgreSQL fails after selection succeeds.
+            with connection.transaction():
+                missed_count = reconcile_missed_slots(connection, run_time=run_time)
+                scheduled_links = select_due_work(connection, run_time=run_time)
+                if not scheduled_links.empty:
+                    if session_factories is None:
+                        session_factories = _default_session_factories()
+                    if set(session_factories) != {prefix for prefix, _ in BOOKMAKERS}:
+                        raise ValueError("Provide session factories for cal, pn, and pd")
+                    runs = prepare_runs(scheduled_links)
+                    queue.enqueue(prepare_collection(runs))
+                    start_runs(connection, runs)
+            if missed_count:
+                print(f"Recorded {missed_count} missed scheduled slot(s)")
+    except (psycopg.OperationalError, psycopg.InterfaceError) as error:
+        if runs is None:
+            raise
+        print(f"Run registration queued at {queue.path}: {type(error).__name__}: {_error_text(error)}")
+    if runs is None:
+        print(f"No matches scheduled for {run_time.floor('min').isoformat()}")
+        return pd.DataFrame()
+    print(f"Scraping {len(runs)} scheduled match(es)")
+    batch_results = collect_bookmaker_outcomes(runs, session_factories)
+    queue.enqueue(prepare_collection(runs, batch_results))
+    persisted = _replay_outcomes(queue, database_url)
+    summary = _build_dataframe(runs, batch_results)
+    summary.attrs["storage_status"] = "persisted" if persisted else "queued"
+    return summary
 
 
 if __name__ == "__main__":

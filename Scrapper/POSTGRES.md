@@ -24,8 +24,10 @@ writes `links.csv`, `schedules.csv`, or instance CSV files. The minute scraper
 returns an in-memory summary and persists its results in PostgreSQL.
 
 On the first minute check, the scraper creates `scraper_runs`, `bookmaker_outcomes`,
-and `outcome_odds`. It commits a distinct run UUID, intended slot ID, and actual
-UTC `started_at` before opening bookmaker sessions. Each bookmaker attempt
+and `outcome_odds`. It durably records a distinct run UUID, intended slot ID,
+and actual UTC `started_at` before opening bookmaker sessions. Registration
+normally commits in PostgreSQL; a local registration payload survives an outage
+after work selection. Each bookmaker attempt
 has its own UUID, actual `attempted_at`, source timestamp where available,
 source name and URL, status (`ok`, `partial`, `failed`, or `missing_link`), and
 error details and a one-based `attempt_number` within its run and bookmaker.
@@ -40,9 +42,10 @@ timestamps produce a null source timestamp and an error detail while preserving
 the odds; the actual outcome time is recorded independently.
 
 All attempts from one collection launch and its `completed_at` timestamps commit
-together. A database write failure propagates as an error, leaving the previously
-committed runs incomplete (`completed_at IS NULL`). A process interruption can
-also leave an incomplete run. Durable outage replay belongs to #7.
+together. Completed collections first commit to a local SQLite queue. A
+PostgreSQL write failure leaves the previously committed runs incomplete
+(`completed_at IS NULL`) until replay delivers their results. A process
+interruption before collection completes can also leave an incomplete run.
 
 Every failed retry is retained before a successful or final failed reading,
 including transient session startup failures. Startup failures apply only to
@@ -58,6 +61,46 @@ attempt IDs; there is no uniqueness constraint on the scheduled slot in
 The first minute check upgrades an existing ticket #4 database transactionally by
 adding `attempt_number` and a unique index on `(run_id, bookmaker, attempt_number)`.
 Existing outcomes keep their IDs, times, and odds and receive attempt number 1.
+
+The durable queue defaults to
+`$XDG_STATE_HOME/agentic-sports-betting/outcomes.sqlite3`, or
+`~/.local/state/agentic-sports-betting/outcomes.sqlite3` when `XDG_STATE_HOME` is
+unset. Set `SCRAPER_QUEUE_PATH` to choose a persistent local file; controlled
+calls can pass `generate_instance(queue_path=...)`. Keep the same path across
+invocations. SQLite uses Python's standard library and needs no extra driver.
+Queue storage errors propagate so a collection is never reported as safely
+queued when its local write failed.
+
+Each completed payload contains the original run and attempt UUIDs, UTC start,
+attempt, source and completion times, status, error, links, missing fields, and
+all numeric odds. Decimal prices are represented as exact strings in the queue
+and restored as PostgreSQL `NUMERIC`; unavailable prices remain null. Queue
+files contain no database connection strings. SQLite's
+[`synchronous=EXTRA`](https://www.sqlite.org/pragma.html#pragma_synchronous)
+setting provides durable local commits.
+
+Each minute invocation replays pending registrations and collections before
+checking new due work, even when nothing is due. Selection assigns stable run
+IDs and queues their registration before trying to register them in PostgreSQL.
+If registration or its commit acknowledgement fails because of a connection
+outage, collection continues using these durable local run identities. An
+interrupted collection can therefore replay as an incomplete run.
+Collection uses the same run IDs and
+queues its completed payload before attempting a fresh PostgreSQL connection.
+PostgreSQL commits the whole payload before the queue acknowledges delivery.
+If the remote commit succeeds but its acknowledgement is lost, the next replay
+uses the same IDs and
+[`ON CONFLICT`](https://www.postgresql.org/docs/current/sql-insert.html)
+to keep one copy of each original record. Completion timestamps do not change
+on replay. Distinct launches and retries keep their distinct IDs and records.
+Failed delivery retains the payload and following collections for the next
+invocation; it logs the failure and queue path. The returned summary's
+`attrs["storage_status"]` is `persisted` or `queued`.
+
+If PostgreSQL cannot select due work, the invocation fails before
+opening browsers. No observations are invented; reconciliation records passed
+slots after the database recovers. Replay requires the original discovery and
+schedule records to remain in PostgreSQL.
 
 For example, query home-win prices and gaps with:
 
@@ -96,7 +139,11 @@ duplicate missed records. Rediscovery does not erase elapsed gaps when kickoff
 changes; future slots cancelled by rescheduling do not become missed records.
 Reconciliation, due selection, and run registration share one transaction and
 lock, so overlapping minute checks cannot mark selected work missed before its
-run is registered. The transaction commits before bookmaker IO begins.
+run is registered during normal operation. The transaction commits before
+bookmaker IO begins. If a selected run's registration was retained only locally
+during an outage, another check can provisionally mark its slot missed. Replay
+registers the real run and removes that false missed marker, preserving its
+actual start time and observations. Gaps with no real run remain recorded.
 
 Query missed collection alongside its intended time with:
 
@@ -144,6 +191,14 @@ the upgrade from ticket #4, and committed run visibility before bookmaker IO.
 It also covers missed-slot reconciliation after downtime with no due work,
 repeated checks, collection within the current minute, failed and incomplete
 runs, and cancellation and historical gaps after a kickoff change.
+The outage tests cover replay of partial readings and retries, lost remote
+commit acknowledgement without duplicate records or changed timestamps, and
+database unavailability before work selection, an outage during run registration,
+and correction of a provisional missed marker after replay. Each workflow uses its own
+temporary queue file.
+`test_outcome_queue.py` exercises real temporary SQLite storage locally,
+including process exit after enqueue, reopening, failed delivery, ambiguous
+remote commits, and preservation of original metadata and decimal prices.
 `generate_instance(session_factories=...)`
 accepts factories keyed by `cal`, `pn`, and `pd` for these controlled responses;
 the default CLI retains the existing headed browser sessions.

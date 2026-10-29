@@ -1,7 +1,7 @@
 """Typed bookmaker outcomes and durable identities for launched scraper runs."""
 
 from decimal import Decimal, InvalidOperation
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pandas as pd
 
@@ -92,18 +92,30 @@ def _create_run_tables(connection):
     """)
     connection.execute("CREATE INDEX IF NOT EXISTS scraper_runs_slot_idx ON scraper_runs(slot_id)")
     connection.execute("CREATE INDEX IF NOT EXISTS bookmaker_outcomes_run_idx ON bookmaker_outcomes(run_id)")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS missed_slots (
+            slot_id UUID PRIMARY KEY REFERENCES scheduled_slots(id),
+            detected_at TIMESTAMPTZ NOT NULL
+        )
+    """)
 
 
-def start_runs(connection, scheduled_links):
-    """Commit one distinct run per selected slot before starting bookmaker IO."""
+def prepare_runs(scheduled_links):
+    """Assign each selected slot a stable identity before remote registration."""
     runs = scheduled_links.copy()
     runs["run_id"] = [uuid4() for _ in range(len(runs))]
     runs["started_at"] = [utc_timestamp() for _ in range(len(runs))]
+    return runs
+
+
+def start_runs(connection, runs):
+    """Register prepared runs before bookmaker IO, reusing their original IDs."""
     with connection.transaction():
         _create_run_tables(connection)
         with connection.cursor() as cursor:
             cursor.executemany(
-                "INSERT INTO scraper_runs (id, slot_id, started_at) VALUES (%s, %s, %s)",
+                "INSERT INTO scraper_runs (id, slot_id, started_at) VALUES (%s, %s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
                 [(row["run_id"], row["slot_id"], row["started_at"].to_pydatetime())
                  for _, row in runs.iterrows()],
             )
@@ -119,12 +131,6 @@ def reconcile_missed_slots(connection, run_time=None):
     minute = utc_timestamp(run_time).floor("min")
     with connection.transaction():
         _create_run_tables(connection)
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS missed_slots (
-                slot_id UUID PRIMARY KEY REFERENCES scheduled_slots(id),
-                detected_at TIMESTAMPTZ NOT NULL
-            )
-        """)
         result = connection.execute("""
             INSERT INTO missed_slots (slot_id, detected_at)
             SELECT s.id, %s
@@ -137,45 +143,85 @@ def reconcile_missed_slots(connection, run_time=None):
     return result.rowcount
 
 
-def _store_attempt(connection, run, bookmaker, result):
-    url = run[LINK_COLUMNS[bookmaker]]
+def prepare_collection(runs, batch_results=None):
+    """Freeze registration or completed results in a JSON-safe collection."""
+    completed_at = None if batch_results is None else utc_timestamp().isoformat()
+    collection = {"version": 1, "id": str(uuid4()), "runs": []}
+    for row_index, run in runs.iterrows():
+        record = {
+            "id": str(run["run_id"]), "slot_id": str(run["slot_id"]),
+            "started_at": run["started_at"].isoformat(),
+            "completed_at": completed_at, "outcomes": [],
+        }
+        collection["runs"].append(record)
+        if batch_results is None:
+            continue
+        for prefix, bookmaker in BOOKMAKER_NAMES.items():
+            url = run[LINK_COLUMNS[bookmaker]]
+            for result in batch_results[prefix][row_index]["attempts"]:
+                source_timestamp = result.get("source_timestamp")
+                odds = result.get("odds", dict.fromkeys(ODDS_FIELDS))
+                record["outcomes"].append({
+                    "id": str(result["id"]), "bookmaker": bookmaker,
+                    "attempt_number": result["attempt_number"],
+                    "attempted_at": result["attempted_at"].isoformat(),
+                    "source_timestamp": None if source_timestamp is None else source_timestamp.isoformat(),
+                    "source_name": result.get("source_name"),
+                    "source_url": None if pd.isna(url) else str(url),
+                    "status": result["status"], "error": result["error"] or None,
+                    "missing_fields": result.get("missing_fields", list(ODDS_FIELDS)),
+                    "odds": {field: None if odds[field] is None else str(odds[field])
+                             for field in ODDS_FIELDS},
+                })
+    return collection
+
+
+def _store_attempt(connection, run_id, result):
     source_timestamp = result.get("source_timestamp")
     connection.execute("""
         INSERT INTO bookmaker_outcomes
             (id, run_id, bookmaker, attempt_number, attempted_at, source_timestamp,
              source_name, source_url, status, error, missing_fields)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO NOTHING
     """, (
-        result["id"], run["run_id"], bookmaker, result["attempt_number"],
-        result["attempted_at"].to_pydatetime(),
-        None if source_timestamp is None else source_timestamp.to_pydatetime(),
-        result.get("source_name"), None if pd.isna(url) else str(url),
+        UUID(result["id"]), UUID(run_id), result["bookmaker"], result["attempt_number"],
+        utc_timestamp(result["attempted_at"]).to_pydatetime(),
+        None if source_timestamp is None else utc_timestamp(source_timestamp).to_pydatetime(),
+        result["source_name"], result["source_url"],
         result["status"], result["error"] or None,
         result.get("missing_fields", list(ODDS_FIELDS)),
     ))
-    odds = result.get("odds", dict.fromkeys(ODDS_FIELDS))
+    odds = result["odds"]
     with connection.cursor() as cursor:
         cursor.executemany(
-            "INSERT INTO outcome_odds (outcome_id, field, value) VALUES (%s, %s, %s)",
-            [(result["id"], field, odds[field]) for field in ODDS_FIELDS],
+            "INSERT INTO outcome_odds (outcome_id, field, value) VALUES (%s, %s, %s) "
+            "ON CONFLICT (outcome_id, field) DO NOTHING",
+            [(UUID(result["id"]), field, None if odds[field] is None else Decimal(odds[field]))
+             for field in ODDS_FIELDS],
         )
 
 
-def store_outcomes(connection, runs, batch_results):
-    """Commit every bookmaker attempt and completion timestamps together.
-
-    Every existing odds field has a numeric row, including explicit SQL NULLs
-    for failures and missing links. No comparison to previous odds is performed.
-    """
+def store_collection(connection, collection):
+    """Commit one frozen collection; replay by original IDs is idempotent."""
+    if collection["version"] != 1:
+        raise ValueError("Unsupported queued collection version")
     with connection.transaction():
-        for row_index, run in runs.iterrows():
-            for prefix, bookmaker in BOOKMAKER_NAMES.items():
-                result = batch_results[prefix][row_index]
-                for attempt in result["attempts"]:
-                    _store_attempt(connection, run, bookmaker, attempt)
-        completed_at = utc_timestamp().to_pydatetime()
-        with connection.cursor() as cursor:
-            cursor.executemany(
-                "UPDATE scraper_runs SET completed_at = %s WHERE id = %s",
-                [(completed_at, run_id) for run_id in runs["run_id"]],
+        _create_run_tables(connection)
+        for run in collection["runs"]:
+            connection.execute(
+                "INSERT INTO scraper_runs (id, slot_id, started_at) VALUES (%s, %s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
+                (UUID(run["id"]), UUID(run["slot_id"]), utc_timestamp(run["started_at"]).to_pydatetime()),
             )
+            for result in run["outcomes"]:
+                _store_attempt(connection, run["id"], result)
+            # An offline launch may have been classified as missed before its
+            # registration reached PostgreSQL. Keep attempted slots distinct.
+            connection.execute("DELETE FROM missed_slots WHERE slot_id = %s",
+                               (UUID(run["slot_id"]),))
+            if run["completed_at"] is not None:
+                connection.execute(
+                    "UPDATE scraper_runs SET completed_at = COALESCE(completed_at, %s) WHERE id = %s",
+                    (utc_timestamp(run["completed_at"]).to_pydatetime(), UUID(run["id"])),
+                )

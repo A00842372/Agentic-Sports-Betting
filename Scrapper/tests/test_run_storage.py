@@ -7,6 +7,7 @@ from unittest.mock import patch
 from uuid import uuid4
 from decimal import Decimal
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pandas as pd
 
@@ -256,6 +257,9 @@ class PersistedRunTests(unittest.TestCase):
         self.database_url = make_conninfo(os.environ["TEST_DATABASE_URL"],
                                          options=f"-c search_path={self.schema}")
         self.connection = psycopg.connect(self.database_url, autocommit=True)
+        self.queue_directory = TemporaryDirectory()
+        self.addCleanup(self.queue_directory.cleanup)
+        self.queue_path = Path(self.queue_directory.name) / "outcomes.sqlite3"
 
     def tearDown(self):
         self.connection.close()
@@ -278,7 +282,155 @@ class PersistedRunTests(unittest.TestCase):
         factories = {prefix: lambda value=value: ControlledSession(value)
                      for prefix, value in values.items()}
         return generate_instance(database_url=self.database_url, run_time=run_time,
-                                 session_factories=factories)
+                                 session_factories=factories, queue_path=self.queue_path)
+
+    def test_outage_after_collection_replays_retries_and_partial_results(self):
+        from generate_instance import generate_instance
+
+        self.seed(bookmakers=("caliente", "pinnacle"))
+        self.collect(run_time="2026-11-01T17:39:00Z")
+        self.connection.execute("""
+            CREATE FUNCTION reject_outcome_writes() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'database unavailable' USING ERRCODE = '08006';
+            END;
+            $$
+        """)
+        self.connection.execute("""
+            CREATE TRIGGER reject_outcome_writes BEFORE INSERT ON bookmaker_outcomes
+            FOR EACH ROW EXECUTE FUNCTION reject_outcome_writes()
+        """)
+        partial = reading("cal")
+        partial["cal_DRAW"] = pd.NA
+        before = utc_timestamp()
+        result = generate_instance(
+            database_url=self.database_url, run_time="2026-11-01T17:59:00Z",
+            queue_path=self.queue_path,
+            session_factories={
+                "cal": lambda: ScriptedSession([TimeoutError("temporary timeout"), partial]),
+                "pn": lambda: ControlledSession(ValueError("bad response")),
+                "pd": lambda: ControlledSession(None),
+            },
+        )
+        after = utc_timestamp()
+        self.assertEqual("queued", result.attrs["storage_status"])
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM bookmaker_outcomes").fetchone()[0])
+        self.connection.execute("DROP TRIGGER reject_outcome_writes ON bookmaker_outcomes")
+        self.assertTrue(self.collect(run_time="2026-11-01T18:01:00Z").empty)
+        rows = self.connection.execute(
+            "SELECT o.bookmaker, o.attempt_number, o.status, o.attempted_at, d.value "
+            "FROM bookmaker_outcomes o JOIN outcome_odds d ON d.outcome_id = o.id "
+            "WHERE d.field = 'HT' ORDER BY o.bookmaker, o.attempt_number"
+        ).fetchall()
+        self.assertEqual(["failed", "partial", "failed", "missing_link"], [r[2] for r in rows])
+        self.assertEqual([1, 2, 1, 1], [r[1] for r in rows])
+        self.assertEqual([None, Decimal("2.15"), None, None], [r[4] for r in rows])
+        for row in rows:
+            self.assertLessEqual(before, row[3])
+            self.assertLessEqual(row[3], after)
+        completed_at = self.connection.execute("SELECT completed_at FROM scraper_runs").fetchone()[0]
+        self.assertLessEqual(before, completed_at)
+        self.assertLessEqual(completed_at, after)
+
+    def test_replay_after_lost_commit_acknowledgement_preserves_each_original_record_once(self):
+        import psycopg
+        from generate_instance import collect_bookmaker_outcomes
+        from utilities.outcome_queue import OutcomeQueue
+        from utilities.run_storage import prepare_collection, prepare_runs, start_runs, store_collection
+        from utilities.scheduled_work import select_due_work
+
+        self.seed()
+        runs = start_runs(self.connection, prepare_runs(select_due_work(self.connection, "2026-11-01T17:59:00Z")))
+        results = collect_bookmaker_outcomes(runs, {
+            prefix: lambda prefix=prefix: ControlledSession(reading(prefix))
+            for prefix in ("cal", "pn", "pd")
+        })
+        collection = prepare_collection(runs, results)
+        queue = OutcomeQueue(self.queue_path)
+        queue.enqueue(collection)
+
+        def persist(payload):
+            with psycopg.connect(self.database_url, autocommit=True) as connection:
+                store_collection(connection, payload)
+
+        def commit_without_acknowledgement(payload):
+            persist(payload)
+            raise psycopg.OperationalError("commit acknowledgement lost")
+
+        with self.assertRaises(psycopg.OperationalError):
+            queue.replay(commit_without_acknowledgement)
+        snapshot = self.connection.execute(
+            "SELECT o.id, o.run_id, o.attempted_at, o.source_timestamp, o.status, "
+            "d.field, d.value, r.started_at, r.completed_at "
+            "FROM bookmaker_outcomes o JOIN outcome_odds d ON d.outcome_id = o.id "
+            "JOIN scraper_runs r ON r.id = o.run_id ORDER BY o.id, d.field"
+        ).fetchall()
+        OutcomeQueue(self.queue_path).replay(persist)
+        self.assertEqual([], queue.pending())
+        self.assertEqual(snapshot, self.connection.execute(
+            "SELECT o.id, o.run_id, o.attempted_at, o.source_timestamp, o.status, "
+            "d.field, d.value, r.started_at, r.completed_at "
+            "FROM bookmaker_outcomes o JOIN outcome_odds d ON d.outcome_id = o.id "
+            "JOIN scraper_runs r ON r.id = o.run_id ORDER BY o.id, d.field"
+        ).fetchall())
+        self.assertEqual(90, len(snapshot))
+        expected_ids = {outcome["id"] for outcome in collection["runs"][0]["outcomes"]}
+        self.assertEqual(expected_ids, {str(row[0]) for row in snapshot})
+        self.assertEqual(pd.Timestamp(collection["runs"][0]["completed_at"]), snapshot[0][8])
+
+    def test_outage_before_due_selection_opens_no_sessions_and_later_records_gaps(self):
+        import psycopg
+        from generate_instance import generate_instance
+
+        self.seed()
+
+        def unexpected_session():
+            raise AssertionError("no work was selected")
+
+        with patch("psycopg.connect", side_effect=psycopg.OperationalError("database offline")):
+            with self.assertRaises(psycopg.OperationalError):
+                generate_instance(
+                    database_url=self.database_url, run_time="2026-11-01T17:59:00Z",
+                    queue_path=self.queue_path,
+                    session_factories={prefix: unexpected_session for prefix in ("cal", "pn", "pd")},
+                )
+        self.assertTrue(self.collect(run_time="2026-11-01T18:01:00Z").empty)
+        self.assertEqual(16, self.connection.execute("SELECT count(*) FROM missed_slots").fetchone()[0])
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM scraper_runs").fetchone()[0])
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM bookmaker_outcomes").fetchone()[0])
+
+    def test_outage_after_selection_collects_and_replay_corrects_provisional_missed_slot(self):
+        self.seed()
+        self.collect(run_time="2026-11-01T17:39:00Z")
+        self.connection.execute("""
+            CREATE FUNCTION unavailable_run_storage() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'database unavailable' USING ERRCODE = '08006';
+            END;
+            $$
+        """)
+        self.connection.execute("""
+            CREATE TRIGGER unavailable_run_storage BEFORE INSERT ON scraper_runs
+            FOR EACH ROW EXECUTE FUNCTION unavailable_run_storage()
+        """)
+        result = self.collect()
+        self.assertEqual("queued", result.attrs["storage_status"])
+        self.assertEqual("ok", result.iloc[0]["cal_status"])
+        self.assertEqual(0, self.connection.execute("SELECT count(*) FROM scraper_runs").fetchone()[0])
+        # A concurrent/restarted check can see a gap before the offline run arrives.
+        self.assertTrue(self.collect(run_time="2026-11-01T18:01:00Z").empty)
+        self.assertEqual(16, self.connection.execute("SELECT count(*) FROM missed_slots").fetchone()[0])
+        self.connection.execute("DROP TRIGGER unavailable_run_storage ON scraper_runs")
+        self.assertTrue(self.collect(run_time="2026-11-01T18:02:00Z").empty)
+        self.assertEqual(0, self.connection.execute(
+            "SELECT count(*) FROM missed_slots WHERE slot_id = %s", (result.iloc[0]["slot_id"],),
+        ).fetchone()[0])
+        self.assertEqual(15, self.connection.execute("SELECT count(*) FROM missed_slots").fetchone()[0])
+        self.assertEqual([(result.iloc[0]["run_id"], result.iloc[0]["started_at"])],
+                         self.connection.execute("SELECT id, started_at FROM scraper_runs").fetchall())
+        self.assertEqual(3, self.connection.execute("SELECT count(*) FROM bookmaker_outcomes").fetchone()[0])
 
     def test_discovery_to_scrape_stores_typed_outcomes_without_csv(self):
         self.seed()
@@ -345,6 +497,7 @@ class PersistedRunTests(unittest.TestCase):
 
         result = generate_instance(
             database_url=self.database_url, run_time="2026-11-01T17:59:00Z",
+            queue_path=self.queue_path,
             session_factories={
                 "cal": lambda: ScriptedSession([TimeoutError("temporary timeout"), reading("cal")]),
                 "pn": lambda: ControlledSession(reading("pn")),
@@ -395,6 +548,7 @@ class PersistedRunTests(unittest.TestCase):
 
         result = generate_instance(
             database_url=self.database_url, run_time="2026-11-01T17:59:00Z",
+            queue_path=self.queue_path,
             session_factories={
                 "cal": lambda: ControlledSession(reading("cal"), observe_started_run),
                 "pn": lambda: ControlledSession(reading("pn")),
@@ -457,7 +611,7 @@ class PersistedRunTests(unittest.TestCase):
         self.assertEqual(3, self.connection.execute("SELECT count(*) FROM bookmaker_outcomes").fetchone()[0])
 
     def test_failed_and_incomplete_runs_are_not_missed_slots(self):
-        from utilities.run_storage import start_runs
+        from utilities.run_storage import prepare_runs, start_runs
         from utilities.scheduled_work import select_due_work
 
         self.seed()
@@ -465,9 +619,9 @@ class PersistedRunTests(unittest.TestCase):
             values={prefix: ValueError("invalid response") for prefix in ("cal", "pn", "pd")},
             run_time="2026-11-01T17:45:00Z",
         )
-        incomplete = start_runs(self.connection, select_due_work(
+        incomplete = start_runs(self.connection, prepare_runs(select_due_work(
             self.connection, run_time="2026-11-01T17:46:00Z",
-        ))
+        )))
         self.assertTrue(self.collect(run_time="2026-11-01T18:01:00Z").empty)
         for slot_id in (failed.iloc[0]["slot_id"], incomplete.iloc[0]["slot_id"]):
             self.assertEqual(0, self.connection.execute(
