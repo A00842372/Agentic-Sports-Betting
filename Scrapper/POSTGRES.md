@@ -1,5 +1,8 @@
 # Discovery storage
 
+For the modeling machine's read-only credentials, match history API, and query
+filters, see [HISTORY.md](HISTORY.md).
+
 Install the PostgreSQL driver in the scraper's Python environment:
 
 ```sh
