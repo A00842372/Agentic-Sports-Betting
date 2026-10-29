@@ -1,5 +1,4 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 import os
 from time import sleep
 
@@ -7,18 +6,23 @@ import pandas as pd
 import requests
 
 from utilities.scheduled_work import select_due_work, utc_timestamp
-
-from utilities.caliente_scrapper import CalienteSession
-from utilities.pinnacle_scrapper import PinnacleSession
-from utilities.playdoit_scrapper import PlaydoitSession
+from utilities.run_storage import normalize_reading, start_runs, store_outcomes
 
 
 MAX_ATTEMPTS = 3
 BOOKMAKERS = [
-    ("cal", "Caliente link", CalienteSession),
-    ("pn", "Pinnacle link", PinnacleSession),
-    ("pd", "Playdoit link", PlaydoitSession),
+    ("cal", "Caliente link"),
+    ("pn", "Pinnacle link"),
+    ("pd", "Playdoit link"),
 ]
+
+
+def _default_session_factories():
+    from utilities.caliente_scrapper import CalienteSession
+    from utilities.pinnacle_scrapper import PinnacleSession
+    from utilities.playdoit_scrapper import PlaydoitSession
+
+    return {"cal": CalienteSession, "pn": PinnacleSession, "pd": PlaydoitSession}
 
 
 def _error_text(error):
@@ -60,39 +64,29 @@ def _is_transient_error(error):
 
 
 def _result_from_value(prefix, value):
-    if not isinstance(value, pd.Series):
-        raise TypeError("scraper must return a pandas Series")
+    return {"value": value, **normalize_reading(prefix, value)}
 
-    metadata_columns = [
-        f"{prefix}_match",
-        f"{prefix}_Bookmarker",
-        f"{prefix}_timestamp_utc",
-    ]
-    odds = value.drop(labels=metadata_columns, errors="ignore")
-    missing_odds = odds[odds.isna()].index.tolist()
 
-    if missing_odds:
-        return {
-            "value": value,
-            "status": "partial",
-            "error": "Missing odds: " + ", ".join(missing_odds),
-        }
-    return {"value": value, "status": "ok", "error": ""}
+def _missing_link_result():
+    return {
+        "value": None,
+        "status": "missing_link",
+        "error": "No event link available",
+        "attempted_at": utc_timestamp(),
+    }
 
 
 def _scrape_with_retries(session, prefix, link_column, link_row):
     link = link_row[link_column]
     if pd.isna(link) or not str(link).strip():
-        return {
-            "value": None,
-            "status": "missing_link",
-            "error": "No event link available",
-        }
+        return _missing_link_result()
 
     link = str(link).strip()
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempted_at = utc_timestamp()
         try:
-            return _result_from_value(prefix, session.scrape(link))
+            return {**_result_from_value(prefix, session.scrape(link)),
+                    "attempted_at": attempted_at}
         except Exception as error:
             should_retry = (
                 attempt < MAX_ATTEMPTS and _is_transient_error(error)
@@ -106,6 +100,7 @@ def _scrape_with_retries(session, prefix, link_column, link_row):
                     "value": None,
                     "status": "failed",
                     "error": f"{type(error).__name__}: {_error_text(error)}",
+                    "attempted_at": attempted_at,
                 }
             sleep(2 ** (attempt - 1))
 
@@ -137,9 +132,18 @@ def _scrape_bookmaker_batch(links, prefix, link_column, session_factory):
     """Scrape one bookmaker sequentially through one reusable session."""
     results = {}
     session = None
+    session_started_at = utc_timestamp()
     try:
+        for row_index, link_row in links.iterrows():
+            link = link_row[link_column]
+            if pd.isna(link) or not str(link).strip():
+                results[row_index] = _scrape_with_retries(None, prefix, link_column, link_row)
+        if len(results) == len(links):
+            return prefix, results
         session = _open_session(session_factory, link_column)
         for row_index, link_row in links.iterrows():
+            if row_index in results:
+                continue
             results[row_index] = _scrape_with_retries(
                 session,
                 prefix,
@@ -154,16 +158,13 @@ def _scrape_bookmaker_batch(links, prefix, link_column, session_factory):
                 continue
             link = link_row[link_column]
             if pd.isna(link) or not str(link).strip():
-                results[row_index] = {
-                    "value": None,
-                    "status": "missing_link",
-                    "error": "No event link available",
-                }
+                results[row_index] = _missing_link_result()
             else:
                 results[row_index] = {
                     "value": None,
                     "status": "failed",
                     "error": f"Session failure: {session_error}",
+                    "attempted_at": session_started_at,
                 }
     finally:
         if session is not None:
@@ -183,21 +184,19 @@ def _failed_batch(links, link_column, error):
     for row_index, link_row in links.iterrows():
         link = link_row[link_column]
         if pd.isna(link) or not str(link).strip():
-            results[row_index] = {
-                "value": None,
-                "status": "missing_link",
-                "error": "No event link available",
-            }
+            results[row_index] = _missing_link_result()
         else:
             results[row_index] = {
                 "value": None,
                 "status": "failed",
                 "error": error_text,
+                "attempted_at": utc_timestamp(),
             }
     return results
 
 
-def _run_batches(links):
+def collect_bookmaker_outcomes(links, session_factories):
+    """Collect timestamped final results through the bookmaker session boundary."""
     batch_results = {}
     with ThreadPoolExecutor(max_workers=len(BOOKMAKERS)) as executor:
         futures = {
@@ -206,9 +205,9 @@ def _run_batches(links):
                 links,
                 prefix,
                 link_column,
-                session_factory,
+                session_factories[prefix],
             ): (prefix, link_column)
-            for prefix, link_column, session_factory in BOOKMAKERS
+            for prefix, link_column in BOOKMAKERS
         }
         for future in as_completed(futures):
             prefix, link_column = futures[future]
@@ -231,7 +230,7 @@ def _build_dataframe(links, batch_results):
         match_values = []
         scrape_details = {}
 
-        for prefix, _, _ in BOOKMAKERS:
+        for prefix, _ in BOOKMAKERS:
             result = batch_results[prefix][row_index]
             if result["value"] is not None:
                 match_values.append(result["value"])
@@ -257,6 +256,8 @@ def _build_dataframe(links, batch_results):
                         "match_id": link_row["match_id"],
                         "slot_id": link_row["slot_id"],
                         "scheduled_time": link_row["scheduled_time"],
+                        "run_id": link_row["run_id"],
+                        "started_at": link_row["started_at"],
                     }),
                     match_result,
                     pd.Series(scrape_details),
@@ -267,10 +268,11 @@ def _build_dataframe(links, batch_results):
 
 
 def generate_instance(
-    output_path=None,
     run_time=None,
     database_url=None,
+    session_factories=None,
 ):
+    """Persist due runs and final bookmaker outcomes; return an in-memory summary."""
     database_url = database_url or os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("Set DATABASE_URL for PostgreSQL due-work selection")
@@ -278,22 +280,21 @@ def generate_instance(
     import psycopg
 
     run_time = utc_timestamp(run_time)
-    with psycopg.connect(database_url) as connection:
+    with psycopg.connect(database_url, autocommit=True) as connection:
         scheduled_links = select_due_work(connection, run_time=run_time)
-    if scheduled_links.empty:
-        run_minute = run_time.floor("min")
-        print(f"No matches scheduled for {run_minute.isoformat()}")
-        return pd.DataFrame()
+        if scheduled_links.empty:
+            print(f"No matches scheduled for {run_time.floor('min').isoformat()}")
+            return pd.DataFrame()
 
-    print(f"Scraping {len(scheduled_links)} scheduled match(es)")
-    batch_results = _run_batches(scheduled_links)
-    dataframe = _build_dataframe(scheduled_links, batch_results)
-
-    if output_path is None:
-        timestamp = datetime.now().strftime("%d-%m-%Y %H-%M-%S")
-        output_path = f"instance-{timestamp}.csv"
-    dataframe.to_csv(output_path, index=False)
-    return dataframe
+        if session_factories is None:
+            session_factories = _default_session_factories()
+        if set(session_factories) != {prefix for prefix, _ in BOOKMAKERS}:
+            raise ValueError("Provide session factories for cal, pn, and pd")
+        runs = start_runs(connection, scheduled_links)
+        print(f"Scraping {len(runs)} scheduled match(es)")
+        batch_results = collect_bookmaker_outcomes(runs, session_factories)
+        store_outcomes(connection, runs, batch_results)
+    return _build_dataframe(runs, batch_results)
 
 
 if __name__ == "__main__":
